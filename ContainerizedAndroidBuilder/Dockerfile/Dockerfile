@@ -1,19 +1,22 @@
 FROM debian:bullseye
 
-ARG USER
+LABEL maintainer="iusmac <iusico.maxim@libero.it>"
+
 ARG EMAIL
 ARG UID
 ARG GID
 
 # Environment variables
 #---------------------#
+ENV USER android
 ENV DEBIAN_FRONTEND noninteractive
 ENV SRC_DIR /mnt/src
-ENV OUT_DIR /mnt/src/out
+ENV OUT_DIR /mnt/out
 ENV CCACHE_DIR /mnt/ccache
 ENV CCACHE_EXEC /usr/bin/ccache
 ENV LOGS_DIR /mnt/logs
 ENV ZIP_DIR /mnt/zips
+ENV TERM xterm-256color
 
 # Create host user
 #----------------#
@@ -58,7 +61,7 @@ RUN ln -s /usr/bin/python3 /usr/bin/python
 # Download latest repo
 #--------------------#
 ADD https://storage.googleapis.com/git-repo-downloads/repo /usr/local/bin/repo
-RUN chmod a+rx /usr/local/bin/repo
+RUN chmod a+rwx /usr/local/bin/repo
 
 # Run everything as non-root
 #--------------------------#
@@ -74,8 +77,8 @@ USER $USER
 #--------------#
 RUN git config --global user.name $USER
 RUN git config --global user.email $EMAIL
-RUN export MAVEN_OPTS="-Xms8000m -Xmx8000m"
-RUN export JACK_SERVER_VM_ARGUMENTS="-Dfile.encoding=UTF-8 -XX:+TieredCompilation -Xmx8096m"
+RUN echo 'source /mnt/.bashrc_extra/.bashrc_extra' > /home/$USER/.bash_aliases
+RUN export MAVEN_OPTS="-Xms8000m -Xmx8000m"&&export JACK_SERVER_VM_ARGUMENTS="-Dfile.encoding=UTF-8 -XX:+TieredCompilation -Xmx8096m"
 # Set work directory
 #------------------#
 WORKDIR $SRC_DIR

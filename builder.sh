@@ -3,7 +3,7 @@
 bash ContainerizedAndroidBuilder/run.sh \
     --email 'liwenjie119@126.com' \
     --repo-url 'https://github.com/PixelExperience/manifest' \
-    --repo-revision 'thirteen' \
+    --repo-revision 'thirteen-plus' \
     --lunch-system 'aosp' \
     --lunch-device 'raphael' \
     --lunch-flavor 'userdebug' \

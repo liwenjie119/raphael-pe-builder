@@ -2,28 +2,31 @@
 
 set -o errexit -o pipefail
 
-readonly __VERSION__='5.0 (A13)'
-readonly __IMAGE_VERSION__='2.1'
+readonly __VERSION__='1.0'
+readonly __IMAGE_VERSION__='1.0'
 __DIR__="$(cd -P -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly __DIR__
-readonly __CONTAINER_NAME__='containerized_android_builder_a12'
+readonly __CONTAINER_NAME__='containerized_android_builder'
 readonly __REPOSITORY__="iusmac/$__CONTAINER_NAME__"
 readonly __IMAGE_TAG__="$__REPOSITORY__:v$__IMAGE_VERSION__"
-readonly __MENU_BACKTITLE__="Android OS Builder v$__VERSION__ | (c) 2022 iusmac"
+readonly __MENU_BACKTITLE__="ContainerizedAndroidBuilder v$__VERSION__ (using Docker image v$__IMAGE_VERSION__) | (c) 2022 iusmac"
+readonly __CACHE_DIR__='cache'
+readonly __MISC_DIR__='misc'
+readonly __HOME_DIR__="$__CACHE_DIR__/home"
 declare -rA __USER_IDS__=(
-    ['name']="$USER"
     ['uid']="$(id --user "$USER")"
     ['gid']="$(id --group "$USER")"
 )
 declare -A __ARGS__=(
-    ['email']=''
+    ['android']=''
+    ['email']='docker@localhost'
     ['repo-url']=''
     ['repo-revision']=''
     ['lunch-system']=''
     ['lunch-device']=''
     ['lunch-flavor']=''
     ['src-dir']="$PWD"/src
-    ['out-dir']="$PWD"/src/out
+    ['out-dir']="$PWD"/out
     ['zips-dir']="$PWD"/zips
     ['move-zips']=0
     ['ccache-dir']="$PWD"/ccache
@@ -39,7 +42,7 @@ function main() {
         exit 1
     fi
 
-    mkdir -p logs/ .home/ \
+    mkdir -p logs/ "$__CACHE_DIR__"/ "$__MISC_DIR__"/ \
         "${__ARGS__['src-dir']}"/.repo/local_manifests/ \
         "${__ARGS__['out-dir']}" \
         "${__ARGS__['zips-dir']}" \
@@ -48,6 +51,17 @@ function main() {
     local param value
     while [ $# -gt 0 ]; do
         param="${1:2}"; value="$2"
+
+        if [ "$param" = 'version' ]; then
+            printf -- "ContainerizedAndroidBuilder v%s (using Docker image v%s)\n" \
+                "$__VERSION__" "$__IMAGE_VERSION__"
+            exit 0
+        fi
+
+        if [ "$param" = 'help' ]; then
+            printHelp
+            exit 0
+        fi
 
         if [ "$param" = 'ccache-disabled' ]; then
             __ARGS__['ccache-disabled']=1
@@ -69,7 +83,8 @@ function main() {
         __ARGS__['timezone']="$timezone"
     fi
 
-    for arg in 'email' \
+    for arg in \
+        'android' \
         'repo-url' \
         'repo-revision' \
         'lunch-system' \
@@ -91,10 +106,12 @@ function main() {
             '1) Sources' 'Manage android source code' \
             '2) Build' 'Start/stop or resume a build' \
             '3) Stop tasks' 'Stop gracefully running tasks' \
-            '4) Progress' 'Show current build state' \
-            '5) Logs' 'Show previous build logs' \
-            '6) Suspend/Hibernate' 'Suspend or hibernate this machine' \
-            '7) Self update' 'Get the latest version' \
+            '4) Jump inside' 'Get into the Docker container shell' \
+            '5) Progress' 'Show current build state' \
+            '6) Logs' 'Show previous build logs' \
+            '7) Suspend/Hibernate' 'Suspend or hibernate this machine' \
+            '8) Self-update' 'Get the latest version' \
+            '9) Self-destroy' 'Stop all tasks and remove Docker image' \
             3>&1 1>&2 2>&3)"; then
             return 0
         fi
@@ -103,10 +120,12 @@ function main() {
             1*) sourcesMenu;;
             2*) buildMenu;;
             3*) stopMenu;;
-            4*) progressMenu;;
-            5*) logsMenu;;
-            6*) suspendMenu;;
-            7*) selfUpdateMenu;;
+            4*) runInContainer /bin/bash;;
+            5*) progressMenu;;
+            6*) logsMenu;;
+            7*) suspendMenu;;
+            8*) selfUpdateMenu;;
+            9*) selfDestroyMenu;;
             *) printf "Unrecognized main menu action: %s\n" "$action" >&2
                 exit 1
         esac
@@ -124,6 +143,7 @@ function sourcesMenu() {
             '1) Init' 'Set repo URL to an android project' \
             '2) Sync All' 'Sync all sources' \
             '3) Selective Sync' 'Selectively sync projects in "local_manifests/"' \
+            '4) Selective Sync (cached)' 'Same as option n.3 but reuses a cached repo list' \
             3>&1 1>&2 2>&3)"; then
             return 0
         fi
@@ -141,6 +161,8 @@ function sourcesMenu() {
             1*) sourcesMenu__repoInit;;
             2*) sourcesMenu__repoSync;;
             3*) sourcesMenu__repoSyncLocalManifest;;
+            4*) sourcesMenu__repoSyncLocalManifest \
+                "$(cat "$__HOME_DIR__"/.repo-list.raw 2>/dev/null)";;
             *) printf "Undefined source menu action: %s\n" "$action" >&2
                 exit 1
         esac
@@ -173,13 +195,15 @@ function sourcesMenu__repoSync() {
 }
 
 function sourcesMenu__repoSyncLocalManifest() {
-    printf "Generating project list...\n"
-
-    local repo_list_raw
-    if ! repo_list_raw="$(containerQuery 'repo-local-list')"; then
-        printf -- "%s\n" "$repo_list_raw" >&2
-        showLogs
-        return 0
+    local repo_list_raw="${1:-}"
+    if [ -z "$repo_list_raw" ]; then
+        printf "Generating project list...\n"
+        if ! repo_list_raw="$(containerQuery 'repo-local-list')"; then
+            printf -- "%s\n" "$repo_list_raw" >&2
+            showLogs
+            return 0
+        fi
+        echo "$repo_list_raw" > "$__HOME_DIR__"/.repo-list.raw
     fi
 
     declare -a repo_list=()
@@ -392,35 +416,61 @@ function selfUpdateMenu() {
         exit 1
     fi
 
-    git pull --recurse-submodules --force --rebase; local code=$?
-    if [ $code -gt 0 ]; then
-        exit $?
+    if assertIsRunningContainer; then
+        printf "Found a running container, stopping...\n" >&2
+        sudo docker container stop $__CONTAINER_NAME__ || exit $?
     fi
+
+    git pull --recurse-submodules --force --rebase || exit $?
 
     printf "You've successfully upgraded. Run the builder again when you wish it ;)\n"
     exit 0
 }
 
-function containerQuery() {
-    local home="/home/${__USER_IDS__['name']}"
+function selfDestroyMenu() {
+    local msg; msg="$(cat << EOL
+Are you sure you want to kill all running tasks and remove Docker image from disk?
 
-    if assertIsRunningContainer; then
-        local msg
-        msg="$(cat << EOL
-There are already running tasks. Stop them and retry.
-
-Hint: navigate to Main menu -> Stop tasks
+NOTE: this won't remove sources or out files. You have to remove
+      them manually.
 EOL
-        )"
-        whiptail \
-            --backtitle "$__MENU_BACKTITLE__" \
-            --title 'Error' \
-            --msgbox "$msg" 0 0
-
+    )"
+    if ! whiptail \
+        --title 'Self-destroy' \
+        --yesno "$msg" \
+        --defaultno \
+        0 0 \
+        3>&1 1>&2 2>&3; then
         return 0
     fi
 
-    # Build image if does not exist
+    if assertIsRunningContainer; then
+        printf "Found a running container, stopping...\n" >&2
+        sudo docker container stop $__CONTAINER_NAME__ || exit $?
+    fi
+
+    local img_list id tag
+    printf "Retrieving image list...\n" >&2
+    img_list="$(getImageList)"
+
+    while IFS='=' read -r id tag; do
+        if [ -n "$id" ] && [ -n "$tag" ]; then
+            printf "Removing image with tag: %s\n" "$tag" >&2
+            sudo docker rmi "$id"
+        fi
+    done <<< "$img_list"
+
+    if [ -z "$img_list" ]; then
+        printf "No images to remove.\n" >&2
+    fi
+}
+
+function containerQuery() {
+    local query="${1?}"; shift
+    runInContainer /mnt/entrypoint/entrypoint.sh "$query" "$@"
+}
+
+function buildImageIfNone() {
     if ! sudo docker inspect --type image "$__IMAGE_TAG__" &> /dev/null; then
         local id tag
         while IFS='=' read -r id tag; do
@@ -428,68 +478,152 @@ EOL
                 printf "Removing unused image with tag: %s\n" "$tag" >&2
                 sudo docker rmi "$id"
             fi
-        done < <(sudo docker images --format '{{.ID}}={{.Tag}}' $__REPOSITORY__)
+        done <<< "$(getImageList)"
 
         printf "Note: Unable to find '%s' image. Start building...\n" "$__IMAGE_TAG__" >&2
         printf "This may take a while...\n\n" >&2
         sudo DOCKER_BUILDKIT=1 docker build \
             --no-cache \
-            --build-arg USER="${__USER_IDS__['name']}" \
             --build-arg EMAIL="${__ARGS__['email']}" \
             --build-arg UID="${__USER_IDS__['uid']}" \
             --build-arg GID="${__USER_IDS__['gid']}" \
-            --tag "$__IMAGE_TAG__" "$__DIR__"/Dockerfile/ &&
+            --tag "$__IMAGE_TAG__" "$__DIR__"/Dockerfile/ || exit $?
+    fi
 
-        printf "We're almost there...\n" >&2
-        sudo docker run \
-            --interactive \
-            --rm \
-            --name "$__CONTAINER_NAME__" \
-            --detach=true \
-            "$__IMAGE_TAG__" >&2 &&
+    copyFilesToHost
+}
 
-        sudo docker container cp \
-            --archive \
-            "$__CONTAINER_NAME__":"$home"/. .home &&
+function copyFilesToHost() {
+    # Example: ['SRC_PATH/.'='DEST_PATH']
+    # NB.: if DEST_PATH is a directory and
+    # ├── SRC_PATH does not end with /. (that is: slash followed by dot)
+    # │   └── the source directory is copied into this directory
+    # │ 
+    # └── SRC_PATH does end with /. (that is: slash followed by dot)
+    #     └── the content of the source directory is copied into this directory
+    declare -A flist=(
+        ['/home/android/.']="$__HOME_DIR__"
+        ['/etc/passwd']="$__CACHE_DIR__/passwd.orig"
+        ['/etc/group']="$__CACHE_DIR__/group.orig"
+    )
 
+    local source_ target running=0
+    for source_ in "${!flist[@]}"; do
+        target="${flist["$source_"]}"
+
+        if [ ! -e "$target" ]; then
+            printf "Copying missing target to host: %s\n" "$target" >&2
+            if [ $running -eq 0 ]; then
+                if assertIsRunningContainer; then
+                    printf "Found a running container, stopping...\n" >&2
+                    sudo docker container stop "$__CONTAINER_NAME__" >/dev/null || exit $?
+                fi
+                sudo docker run \
+                    --interactive \
+                    --rm \
+                    --name "$__CONTAINER_NAME__" \
+                    --detach=true \
+                    "$__IMAGE_TAG__" >&2 || exit $?
+                running=1
+            fi
+
+            sudo docker container cp \
+                --archive \
+                "$__CONTAINER_NAME__":"$source_" "$target" || exit $?
+        fi
+    done
+
+    if [ $running -eq 1 ]; then
+        printf "Finishing...\n" >&2
         # TODO: this is a workaround because '--archive' argument for 'docker
         # container cp' command is broken. Check from time to time if it has
         # been fixed.
-        sudo find .home -exec chown \
+        sudo chown \
             --silent \
             --recursive \
             "${__USER_IDS__['uid']}":"${__USER_IDS__['gid']}" \
-            {} \+
+            "${flist[@]}" &&
 
-        printf "Finishing...\n" >&2
         sudo docker container stop "$__CONTAINER_NAME__" >/dev/null || exit $?
     fi
+}
 
-    local query="${1?}"; shift
-    local entrypoint=/mnt/entrypoint.sh
-    local use_ccache=${__ARGS__['ccache-disabled']}
+function setUpUser() {
+    local uid="${1?}" gid="${2?}" home="${3?}"
+    {
+        # NOTE: keep user on top to ensure it's picked up regardless of
+        # duplicates
+        printf "android:x:%d:%d::%s:/bin/bash\n" "$uid" "$gid" "$home"
+        cat "$__CACHE_DIR__"/passwd.orig
+    } > "$__CACHE_DIR__"/passwd || exit $?
+
+    {
+        # NOTE: keep group on top to ensure it's picked up regardless of
+        # duplicates
+        printf "android:x:%d\n" "$gid"
+        cat "$__CACHE_DIR__"/group.orig
+    } > "$__CACHE_DIR__"/group || exit $?
+}
+
+function runInContainer() {
+    local uid="${__USER_IDS__['uid']}" \
+        gid="${__USER_IDS__['gid']}" \
+        home='/home/android' \
+        use_ccache=${__ARGS__['ccache-disabled']}
     use_ccache=$((use_ccache ^= 1))
-    sudo docker run \
+
+    buildImageIfNone
+    setUpUser "$uid" "$gid" "$home"
+
+    touch "$__MISC_DIR__"/.bash_profile
+
+    if ! assertIsRunningContainer; then
+        sudo docker run \
+            --detach \
+            --interactive \
+            --rm \
+            --name "$__CONTAINER_NAME__" \
+            --tmpfs /tmp:rw,exec,nosuid,nodev,uid="$uid",gid="$gid" \
+            --privileged \
+            --user "$uid":"$gid" \
+            --env ANDROID_VERSION="${__ARGS__['android']}" \
+            --env LUNCH_SYSTEM="${__ARGS__['lunch-system']}" \
+            --env LUNCH_DEVICE="${__ARGS__['lunch-device']}" \
+            --env LUNCH_FLAVOR="${__ARGS__['lunch-flavor']}" \
+            --env TZ="${__ARGS__['timezone']}" \
+            --env USE_CCACHE="$use_ccache" \
+            --env MOVE_ZIPS="${__ARGS__['move-zips']}" \
+            --env CCACHE_SIZE="${__ARGS__['ccache-size']}" \
+            --volume "$PWD/$__CACHE_DIR__"/passwd:/etc/passwd:ro \
+            --volume "$PWD/$__CACHE_DIR__"/group:/etc/group:ro \
+            --volume /etc/timezone:/etc/timezone:ro \
+            --volume /etc/localtime:/etc/localtime:ro \
+            --volume "$__DIR__"/.bashrc_extra:/mnt/.bashrc_extra \
+            --volume "$__DIR__"/entrypoint:/mnt/entrypoint \
+            --volume "${__ARGS__['out-dir']}":/mnt/out \
+            --volume "${__ARGS__['ccache-dir']}":/mnt/ccache \
+            --volume "${__ARGS__['src-dir']}":/mnt/src \
+            --volume "${__ARGS__['zips-dir']}":/mnt/zips \
+            --volume "$PWD"/logs:/mnt/logs \
+            --volume "$PWD/$__HOME_DIR__":"$home" \
+            --volume "$PWD/$__MISC_DIR__":/mnt/misc \
+            "$__IMAGE_TAG__" >&2 || exit $?
+    fi
+
+    sudo docker container exec \
+        --interactive \
         --tty \
-        --rm \
-        --name "$__CONTAINER_NAME__" \
-        --tmpfs /tmp:rw,exec,nosuid,nodev,uid="${__USER_IDS__['uid']}",gid="${__USER_IDS__['gid']}" \
         --privileged \
+        --env ANDROID_VERSION="${__ARGS__['android']}" \
         --env TZ="${__ARGS__['timezone']}" \
         --env USE_CCACHE="$use_ccache" \
         --env MOVE_ZIPS="${__ARGS__['move-zips']}" \
         --env CCACHE_SIZE="${__ARGS__['ccache-size']}" \
-        --volume /etc/timezone:/etc/timezone:ro \
-        --volume /etc/localtime:/etc/localtime:ro \
-        --volume "$__DIR__"/entrypoint.sh:"$entrypoint" \
-        --volume "${__ARGS__['out-dir']}":/mnt/src/out \
-        --volume "${__ARGS__['ccache-dir']}":/mnt/ccache \
-        --volume "${__ARGS__['src-dir']}":/mnt/src \
-        --volume "${__ARGS__['zips-dir']}":/mnt/zips \
-        --volume "$PWD"/logs:/mnt/logs \
-        --volume "$PWD"/.home:"$home" \
-        "$__IMAGE_TAG__" \
-        "$entrypoint" "$query" "$@"
+        $__CONTAINER_NAME__ "$@" || exit $?
+}
+
+function getImageList() {
+    sudo docker images --format '{{.ID}}={{.Tag}}' $__REPOSITORY__
 }
 
 function insertJobNum() {
@@ -526,6 +660,29 @@ function clearLine() {
 function showLogs() {
     read -n1 -rsp 'Press any key to return...'
     clearLine
+}
+
+function printHelp() {
+    printf -- "%s\n" "$(cat << EOL
+Usage: ./${BASH_SOURCE[0]}
+    --android ANDROID
+    --repo-url REPO_URL
+    --repo-revision REPO_REVISION
+    --lunch-system LUNCH_SYSTEM
+    --lunch-device LUNCH_DEVICE
+    --lunch-flavor LUNCH_FLAVOR
+    [--email EMAIL]
+    [--src-dir SRC_DIR]
+    [--out-dir OUT_DIR]
+    [--zips-dir ZIPS_DIR]
+    [--move-zips MOVE_ZIPS]
+    [--ccache-dir CCACHE_DIR]
+    [--ccache-disabled]
+    [--ccache-size CCACHE_SIZE]
+    [--timezone TIMEZONE]
+    [--help] [--version]
+EOL
+    )"
 }
 
 function trapCallback() {

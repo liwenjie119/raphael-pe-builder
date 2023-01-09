@@ -26,7 +26,7 @@ function main() {
                 log "Syncing all sources ($jobs jobs)..."
             fi
 
-            repo sync \
+            export http_proxy=socks5://192.168.100.253:1087&&export https_proxy=socks5://192.168.100.253:1087&&repo sync \
                 --current-branch \
                 --fail-fast \
                 --force-sync \
@@ -68,16 +68,9 @@ function main() {
                 ccache --set-config compression=true || exit $?
             fi
 
-            # Forcefully point to out/ dir because we're mounting this
-            # directory from the outside and somehow it changes to an absolute
-            # path. This will force Soong to look for things in out/ dir using
-            # the absolute path and fail if we will change the mount point for
-            # some reason.
-            export OUT_DIR=out
-
             log 'Running envsetup.sh...'
             # shellcheck disable=SC1091
-            source build/envsetup.sh && export MAVEN_OPTS="-Xms8000m -Xmx8000m" &&export JACK_SERVER_VM_ARGUMENTS="-Dfile.encoding=UTF-8 -XX:+TieredCompilation -Xmx8096m" || exit $?
+            source build/envsetup.sh && export MAVEN_OPTS="-Xms8000m -Xmx8000m" &&export JACK_SERVER_VM_ARGUMENTS="-Dfile.encoding=UTF-8 -XX:+TieredCompilation -Xmx8096m"&&export http_proxy=socks5://192.168.100.253:1087&&export https_proxy=socks5://192.168.100.253:1087 || exit $?
 
             log "Running lunch..."
             lunch "${lunch_system}_${lunch_device}-${lunch_flavor}" || exit $?
@@ -114,7 +107,7 @@ function main() {
                     fi
 
                     if [ -n "$file_pattern" ]; then
-                        find "out/target/product/$lunch_device" \
+                        find "$OUT_DIR/target/product/$lunch_device" \
                             -maxdepth 1 \
                             -type f \
                             -name "$file_pattern" \
@@ -134,11 +127,23 @@ function main() {
 }
 
 function build_metalava() {
-    declare -a docs=(
-        'test-api-stubs-docs-non-updatable'
-        'api-stubs-docs-non-updatable'
-        'services-non-updatable-stubs'
-    )
+    case "$ANDROID_VERSION" in
+        12.*|13.0)
+            declare -a docs=(
+                'test-api-stubs-docs-non-updatable'
+                'api-stubs-docs-non-updatable'
+                'services-non-updatable-stubs'
+            ) ;;
+        11.0)
+            declare -a docs=(
+                'api-stubs-docs'
+                'module-lib-api-stubs-docs'
+                'system-api-stubs-docs'
+                'test-api-stubs-docs'
+            ) ;;
+        *) printf "Metalava: Unsupported Android version: %s\n" "$ANDROID_VERSION"
+            exit 1
+    esac
 
     local doc i=0 jobs="${1?}" n_docs=${#docs[@]}
 
